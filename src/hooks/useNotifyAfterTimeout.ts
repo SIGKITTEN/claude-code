@@ -1,20 +1,15 @@
 import { useEffect } from 'react'
+import {
+  getLastInteractionTime,
+  updateLastInteractionTime,
+} from '../bootstrap/state.js'
+import { useTerminalNotification } from '../ink/useTerminalNotification.js'
 import { sendNotification } from '../services/notifier.js'
-import { memoize } from 'lodash-es'
-
 // The time threshold in milliseconds for considering an interaction "recent" (6 seconds)
-const DEFAULT_INTERACTION_THRESHOLD_MS = 6000
-
-const STATE = {
-  lastInteractionTime: Date.now(),
-}
-
-function updateLastInteractionTime(): void {
-  STATE.lastInteractionTime = Date.now()
-}
+export const DEFAULT_INTERACTION_THRESHOLD_MS = 6000
 
 function getTimeSinceLastInteraction(): number {
-  return Date.now() - STATE.lastInteractionTime
+  return Date.now() - getLastInteractionTime()
 }
 
 function hasRecentInteraction(threshold: number): boolean {
@@ -25,8 +20,10 @@ function shouldNotify(threshold: number): boolean {
   return process.env.NODE_ENV !== 'test' && !hasRecentInteraction(threshold)
 }
 
-// Start tracking the time of the user's last interaction with the app
-const init = memoize(() => process.stdin.on('data', updateLastInteractionTime))
+// NOTE: User interaction tracking is now done in App.tsx's processKeysInBatch
+// function, which calls updateLastInteractionTime() when any input is received.
+// This avoids having a separate stdin 'data' listener that would compete with
+// the main 'readable' listener and cause dropped input characters.
 
 /**
  * Hook that manages desktop notifications after a timeout period.
@@ -40,26 +37,29 @@ const init = memoize(() => process.stdin.on('data', updateLastInteractionTime))
  */
 export function useNotifyAfterTimeout(
   message: string,
-  timeout: number = DEFAULT_INTERACTION_THRESHOLD_MS,
+  notificationType: string,
 ): void {
+  const terminal = useTerminalNotification()
+
   // Reset interaction time when hook is called to make sure that requests
-  // that took a long time to complete don't pop up a notification right away
+  // that took a long time to complete don't pop up a notification right away.
+  // Must be immediate because useEffect runs after Ink's render cycle has
+  // already flushed; without it the timestamp stays stale and a premature
+  // notification fires if the user is idle (no subsequent renders to flush).
   useEffect(() => {
-    init()
-    updateLastInteractionTime()
+    updateLastInteractionTime(true)
   }, [])
 
   useEffect(() => {
     let hasNotified = false
     const timer = setInterval(() => {
-      if (shouldNotify(timeout) && !hasNotified) {
+      if (shouldNotify(DEFAULT_INTERACTION_THRESHOLD_MS) && !hasNotified) {
         hasNotified = true
-        sendNotification({
-          message,
-        })
+        clearInterval(timer)
+        void sendNotification({ message, notificationType }, terminal)
       }
-    }, timeout)
+    }, DEFAULT_INTERACTION_THRESHOLD_MS)
 
-    return () => clearTimeout(timer)
-  }, [message, timeout])
+    return () => clearInterval(timer)
+  }, [message, notificationType, terminal])
 }

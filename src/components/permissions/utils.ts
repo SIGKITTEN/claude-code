@@ -1,6 +1,6 @@
-import { env } from '../../utils/env.js'
-import { CompletionType, logUnaryEvent } from '../../utils/unaryLogging.js'
-import { ToolUseConfirm } from './PermissionRequest.js'
+import { getHostPlatformForAnalytics } from '../../utils/env.js'
+import { type CompletionType, logUnaryEvent } from '../../utils/unaryLogging.js'
+import type { ToolUseConfirm } from './PermissionRequest.js'
 
 export function logUnaryPermissionEvent(
   completion_type: CompletionType,
@@ -10,14 +10,16 @@ export function logUnaryPermissionEvent(
     },
   }: ToolUseConfirm,
   event: 'accept' | 'reject',
+  hasFeedback?: boolean,
 ): void {
-  logUnaryEvent({
+  void logUnaryEvent({
     completion_type,
     event,
     metadata: {
       language_name: 'none',
       message_id,
-      platform: env.platform,
+      platform: getHostPlatformForAnalytics(),
+      hasFeedback: hasFeedback ?? false,
     },
   })
 }

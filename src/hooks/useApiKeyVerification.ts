@@ -1,6 +1,12 @@
 import { useCallback, useState } from 'react'
-import { verifyApiKey } from '../services/claude.js'
-import { getAnthropicApiKey, isDefaultApiKey } from '../utils/config.js'
+import { getIsNonInteractiveSession } from '../bootstrap/state.js'
+import { verifyApiKey } from '../services/api/claude.js'
+import {
+  getAnthropicApiKeyWithSource,
+  getApiKeyFromApiKeyHelper,
+  isAnthropicAuthEnabled,
+  isClaudeAISubscriber,
+} from '../utils/auth.js'
 
 export type VerificationStatus =
   | 'loading'
@@ -17,26 +23,45 @@ export type ApiKeyVerificationResult = {
 
 export function useApiKeyVerification(): ApiKeyVerificationResult {
   const [status, setStatus] = useState<VerificationStatus>(() => {
-    const apiKey = getAnthropicApiKey()
-    return apiKey ? 'loading' : 'missing'
+    if (!isAnthropicAuthEnabled() || isClaudeAISubscriber()) {
+      return 'valid'
+    }
+    // Use skipRetrievingKeyFromApiKeyHelper to avoid executing apiKeyHelper
+    // before trust dialog is shown (security: prevents RCE via settings.json)
+    const { key, source } = getAnthropicApiKeyWithSource({
+      skipRetrievingKeyFromApiKeyHelper: true,
+    })
+    // If apiKeyHelper is configured, we have a key source even though we
+    // haven't executed it yet - return 'loading' to indicate we'll verify later
+    if (key || source === 'apiKeyHelper') {
+      return 'loading'
+    }
+    return 'missing'
   })
   const [error, setError] = useState<Error | null>(null)
 
   const verify = useCallback(async (): Promise<void> => {
-    if (isDefaultApiKey()) {
+    if (!isAnthropicAuthEnabled() || isClaudeAISubscriber()) {
       setStatus('valid')
       return
     }
-
-    const apiKey = getAnthropicApiKey()
+    // Warm the apiKeyHelper cache (no-op if not configured), then read from
+    // all sources. getAnthropicApiKeyWithSource() reads the now-warm cache.
+    await getApiKeyFromApiKeyHelper(getIsNonInteractiveSession())
+    const { key: apiKey, source } = getAnthropicApiKeyWithSource()
     if (!apiKey) {
-      const newStatus = 'missing' as const
+      if (source === 'apiKeyHelper') {
+        setStatus('error')
+        setError(new Error('API key helper did not return a valid key'))
+        return
+      }
+      const newStatus = 'missing'
       setStatus(newStatus)
       return
     }
 
     try {
-      const isValid = await verifyApiKey(apiKey)
+      const isValid = await verifyApiKey(apiKey, false)
       const newStatus = isValid ? 'valid' : 'invalid'
       setStatus(newStatus)
       return
@@ -45,7 +70,7 @@ export function useApiKeyVerification(): ApiKeyVerificationResult {
       // In this case, we still mark the API key as invalid - but we also log the error so we can
       // display it to the user to be more helpful
       setError(error as Error)
-      const newStatus = 'error' as const
+      const newStatus = 'error'
       setStatus(newStatus)
       return
     }

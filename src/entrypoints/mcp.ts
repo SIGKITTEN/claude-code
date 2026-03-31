@@ -2,53 +2,48 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
-  CallToolResultSchema,
+  type CallToolResult,
   ListToolsRequestSchema,
-  ListToolsResultSchema,
-  ToolSchema,
+  type ListToolsResult,
+  type Tool,
 } from '@modelcontextprotocol/sdk/types.js'
-import { z } from 'zod'
-import { zodToJsonSchema } from 'zod-to-json-schema'
-import { AgentTool } from '../tools/AgentTool/AgentTool.js'
-import { hasPermissionsToUseTool } from '../permissions.js'
-import { setCwd } from '../utils/state.js'
-import { getSlowAndCapableModel } from '../utils/model.js'
-import { logError } from '../utils/log.js'
-import { LSTool } from '../tools/lsTool/lsTool.js'
-import { BashTool } from '../tools/BashTool/BashTool.js'
-import { FileEditTool } from '../tools/FileEditTool/FileEditTool.js'
-import { FileReadTool } from '../tools/FileReadTool/FileReadTool.js'
-import { GlobTool } from '../tools/GlobTool/GlobTool.js'
-import { GrepTool } from '../tools/GrepTool/GrepTool.js'
-import { FileWriteTool } from '../tools/FileWriteTool/FileWriteTool.js'
-import { Tool } from '../Tool.js'
-import { Command } from '../commands.js'
+import { getDefaultAppState } from 'src/state/AppStateStore.js'
 import review from '../commands/review.js'
-import { lastX } from '../utils/generators.js'
+import type { Command } from '../commands.js'
+import {
+  findToolByName,
+  getEmptyToolPermissionContext,
+  type ToolUseContext,
+} from '../Tool.js'
+import { getTools } from '../tools.js'
+import { createAbortController } from '../utils/abortController.js'
+import { createFileStateCacheWithSizeLimit } from '../utils/fileStateCache.js'
+import { logError } from '../utils/log.js'
+import { createAssistantMessage } from '../utils/messages.js'
+import { getMainLoopModel } from '../utils/model/model.js'
+import { hasPermissionsToUseTool } from '../utils/permissions/permissions.js'
+import { setCwd } from '../utils/Shell.js'
+import { jsonStringify } from '../utils/slowOperations.js'
+import { getErrorParts } from '../utils/toolErrors.js'
+import { zodToJsonSchema } from '../utils/zodToJsonSchema.js'
 
-type ToolInput = z.infer<typeof ToolSchema.shape.inputSchema>
-
-const state: {
-  readFileTimestamps: Record<string, number>
-} = {
-  readFileTimestamps: {},
-}
+type ToolInput = Tool['inputSchema']
+type ToolOutput = Tool['outputSchema']
 
 const MCP_COMMANDS: Command[] = [review]
 
-const MCP_TOOLS: Tool[] = [
-  AgentTool,
-  BashTool,
-  FileEditTool,
-  FileReadTool,
-  GlobTool,
-  GrepTool,
-  FileWriteTool,
-  LSTool,
-]
-
-export async function startMCPServer(cwd: string): Promise<void> {
-  await setCwd(cwd)
+export async function startMCPServer(
+  cwd: string,
+  debug: boolean,
+  verbose: boolean,
+): Promise<void> {
+  // Use size-limited LRU cache for readFileState to prevent unbounded memory growth
+  // 100 files and 25MB limit should be sufficient for MCP server operations
+  const READ_FILE_STATE_CACHE_SIZE = 100
+  const readFileStateCache = createFileStateCacheWithSizeLimit(
+    READ_FILE_STATE_CACHE_SIZE,
+  )
+  setCwd(cwd)
   const server = new Server(
     {
       name: 'claude/tengu',
@@ -63,105 +58,128 @@ export async function startMCPServer(cwd: string): Promise<void> {
 
   server.setRequestHandler(
     ListToolsRequestSchema,
-    async (): Promise<Zod.infer<typeof ListToolsResultSchema>> => {
-      const tools = await Promise.all(
-        MCP_TOOLS.map(async tool => ({
-          ...tool,
-          description: await tool.description(z.object({})),
-          inputSchema: zodToJsonSchema(tool.inputSchema) as ToolInput,
-        })),
-      )
-
+    async (): Promise<ListToolsResult> => {
+      // TODO: Also re-expose any MCP tools
+      const toolPermissionContext = getEmptyToolPermissionContext()
+      const tools = getTools(toolPermissionContext)
       return {
-        tools,
+        tools: await Promise.all(
+          tools.map(async tool => {
+            let outputSchema: ToolOutput | undefined
+            if (tool.outputSchema) {
+              const convertedSchema = zodToJsonSchema(tool.outputSchema)
+              // MCP SDK requires outputSchema to have type: "object" at root level
+              // Skip schemas with anyOf/oneOf at root (from z.union, z.discriminatedUnion, etc.)
+              // See: https://github.com/anthropics/claude-code/issues/8014
+              if (
+                typeof convertedSchema === 'object' &&
+                convertedSchema !== null &&
+                'type' in convertedSchema &&
+                convertedSchema.type === 'object'
+              ) {
+                outputSchema = convertedSchema as ToolOutput
+              }
+            }
+            return {
+              ...tool,
+              description: await tool.prompt({
+                getToolPermissionContext: async () => toolPermissionContext,
+                tools,
+                agents: [],
+              }),
+              inputSchema: zodToJsonSchema(tool.inputSchema) as ToolInput,
+              outputSchema,
+            }
+          }),
+        ),
       }
     },
   )
 
   server.setRequestHandler(
     CallToolRequestSchema,
-    async (request): Promise<Zod.infer<typeof CallToolResultSchema>> => {
-      const { name, arguments: args } = request.params
-      const tool = MCP_TOOLS.find(_ => _.name === name)
+    async ({ params: { name, arguments: args } }): Promise<CallToolResult> => {
+      const toolPermissionContext = getEmptyToolPermissionContext()
+      // TODO: Also re-expose any MCP tools
+      const tools = getTools(toolPermissionContext)
+      const tool = findToolByName(tools, name)
       if (!tool) {
         throw new Error(`Tool ${name} not found`)
       }
 
+      // Assume MCP servers do not read messages separately from the tool
+      // call arguments.
+      const toolUseContext: ToolUseContext = {
+        abortController: createAbortController(),
+        options: {
+          commands: MCP_COMMANDS,
+          tools,
+          mainLoopModel: getMainLoopModel(),
+          thinkingConfig: { type: 'disabled' },
+          mcpClients: [],
+          mcpResources: {},
+          isNonInteractiveSession: true,
+          debug,
+          verbose,
+          agentDefinitions: { activeAgents: [], allAgents: [] },
+        },
+        getAppState: () => getDefaultAppState(),
+        setAppState: () => {},
+        messages: [],
+        readFileState: readFileStateCache,
+        setInProgressToolUseIDs: () => {},
+        setResponseLength: () => {},
+        updateFileHistoryState: () => {},
+        updateAttributionState: () => {},
+      }
+
       // TODO: validate input types with zod
       try {
-        if (!(await tool.isEnabled())) {
+        if (!tool.isEnabled()) {
           throw new Error(`Tool ${name} is not enabled`)
         }
-        const model = await getSlowAndCapableModel()
         const validationResult = await tool.validateInput?.(
           (args as never) ?? {},
-          {
-            abortController: new AbortController(),
-            options: {
-              commands: MCP_COMMANDS,
-              tools: MCP_TOOLS,
-              slowAndCapableModel: model,
-              forkNumber: 0,
-              messageLogName: 'unused',
-              maxThinkingTokens: 0,
-            },
-            messageId: undefined,
-            readFileTimestamps: state.readFileTimestamps,
-          },
+          toolUseContext,
         )
         if (validationResult && !validationResult.result) {
           throw new Error(
             `Tool ${name} input is invalid: ${validationResult.message}`,
           )
         }
-        const result = tool.call(
+        const finalResult = await tool.call(
           (args ?? {}) as never,
-          {
-            abortController: new AbortController(),
-            messageId: undefined,
-            options: {
-              commands: MCP_COMMANDS,
-              tools: MCP_TOOLS,
-              slowAndCapableModel: await getSlowAndCapableModel(),
-              forkNumber: 0,
-              messageLogName: 'unused',
-              maxThinkingTokens: 0,
-            },
-            readFileTimestamps: state.readFileTimestamps,
-          },
+          toolUseContext,
           hasPermissionsToUseTool,
+          createAssistantMessage({
+            content: [],
+          }),
         )
 
-        const finalResult = await lastX(result)
-
-        if (finalResult.type !== 'result') {
-          throw new Error(`Tool ${name} did not return a result`)
-        }
-
         return {
-          content: Array.isArray(finalResult)
-            ? finalResult.map(item => ({
-                type: 'text' as const,
-                text: 'text' in item ? item.text : JSON.stringify(item),
-              }))
-            : [
-                {
-                  type: 'text' as const,
-                  text:
-                    typeof finalResult === 'string'
-                      ? finalResult
-                      : JSON.stringify(finalResult.data),
-                },
-              ],
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                typeof finalResult === 'string'
+                  ? finalResult
+                  : jsonStringify(finalResult.data),
+            },
+          ],
         }
       } catch (error) {
         logError(error)
+
+        const parts =
+          error instanceof Error ? getErrorParts(error) : [String(error)]
+        const errorText = parts.filter(Boolean).join('\n').trim() || 'Error'
+
         return {
           isError: true,
           content: [
             {
               type: 'text',
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+              text: errorText,
             },
           ],
         }

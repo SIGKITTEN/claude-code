@@ -1,24 +1,31 @@
-import { type Option } from '@inkjs/ui'
-import { optionHeaderKey, type OptionHeader } from './select.js'
+import type { ReactNode } from 'react'
+import type { OptionWithDescription } from './select.js'
 
-type OptionMapItem = (Option | OptionHeader) & {
-  previous: OptionMapItem | undefined
-  next: OptionMapItem | undefined
+type OptionMapItem<T> = {
+  label: ReactNode
+  value: T
+  description?: string
+  previous: OptionMapItem<T> | undefined
+  next: OptionMapItem<T> | undefined
   index: number
 }
 
-export default class OptionMap extends Map<string, OptionMapItem> {
-  readonly first: OptionMapItem | undefined
+export default class OptionMap<T> extends Map<T, OptionMapItem<T>> {
+  readonly first: OptionMapItem<T> | undefined
+  readonly last: OptionMapItem<T> | undefined
 
-  constructor(options: (Option | OptionHeader)[]) {
-    const items: Array<[string, OptionMapItem]> = []
-    let firstItem: OptionMapItem | undefined
-    let previous: OptionMapItem | undefined
+  constructor(options: OptionWithDescription<T>[]) {
+    const items: Array<[T, OptionMapItem<T>]> = []
+    let firstItem: OptionMapItem<T> | undefined
+    let lastItem: OptionMapItem<T> | undefined
+    let previous: OptionMapItem<T> | undefined
     let index = 0
 
     for (const option of options) {
       const item = {
-        ...option,
+        label: option.label,
+        value: option.value,
+        description: option.description,
         previous,
         next: undefined,
         index,
@@ -29,14 +36,15 @@ export default class OptionMap extends Map<string, OptionMapItem> {
       }
 
       firstItem ||= item
+      lastItem = item
 
-      const key = 'value' in option ? option.value : optionHeaderKey(option)
-      items.push([key, item])
+      items.push([option.value, item])
       index++
       previous = item
     }
 
     super(items)
     this.first = firstItem
+    this.last = lastItem
   }
 }

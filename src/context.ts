@@ -1,151 +1,110 @@
+import { feature } from 'bun:bundle'
+import memoize from 'lodash-es/memoize.js'
 import {
-  getCurrentProjectConfig,
-  saveCurrentProjectConfig,
-} from './utils/config.js'
-import { logError } from './utils/log.js'
-import { getCodeStyle } from './utils/style.js'
-import { getCwd } from './utils/state.js'
-import { memoize, omit } from 'lodash-es'
-import { LSTool } from './tools/lsTool/lsTool.js'
-import { getIsGit } from './utils/git.js'
-import { ripGrep } from './utils/ripgrep.js'
-import * as path from 'path'
+  getAdditionalDirectoriesForClaudeMd,
+  setCachedClaudeMdContent,
+} from './bootstrap/state.js'
+import { getLocalISODate } from './constants/common.js'
+import {
+  filterInjectedMemoryFiles,
+  getClaudeMds,
+  getMemoryFiles,
+} from './utils/claudemd.js'
+import { logForDiagnosticsNoPII } from './utils/diagLogs.js'
+import { isBareMode, isEnvTruthy } from './utils/envUtils.js'
 import { execFileNoThrow } from './utils/execFileNoThrow.js'
-import { join } from 'path'
-import { readFile } from 'fs/promises'
-import { existsSync } from 'fs'
-import { getSlowAndCapableModel } from './utils/model.js'
-import { lastX } from './utils/generators.js'
-import { getGitEmail } from './utils/user.js'
+import { getBranch, getDefaultBranch, getIsGit, gitExe } from './utils/git.js'
+import { shouldIncludeGitInstructions } from './utils/gitSettings.js'
+import { logError } from './utils/log.js'
 
-/**
- * Find all CLAUDE.md files in the current working directory
- */
-export async function getClaudeFiles(): Promise<string | null> {
-  const abortController = new AbortController()
-  const timeout = setTimeout(() => abortController.abort(), 3000)
-  try {
-    const files = await ripGrep(
-      ['--files', '--glob', join('**', '*', 'CLAUDE.md')],
-      getCwd(),
-      abortController.signal,
-    )
-    if (!files.length) {
-      return null
-    }
+const MAX_STATUS_CHARS = 2000
 
-    // Add instructions for additional CLAUDE.md files
-    return `NOTE: Additional CLAUDE.md files were found. When working in these directories, make sure to read and follow the instructions in the corresponding CLAUDE.md file:\n${files
-      .map(_ => path.join(getCwd(), _))
-      .map(_ => `- ${_}`)
-      .join('\n')}`
-  } catch (error) {
-    logError(error)
-    return null
-  } finally {
-    clearTimeout(timeout)
-  }
+// System prompt injection for cache breaking (ant-only, ephemeral debugging state)
+let systemPromptInjection: string | null = null
+
+export function getSystemPromptInjection(): string | null {
+  return systemPromptInjection
 }
 
-export function setContext(key: string, value: string): void {
-  const projectConfig = getCurrentProjectConfig()
-  const context = omit(
-    { ...projectConfig.context, [key]: value },
-    'codeStyle',
-    'directoryStructure',
-  )
-  saveCurrentProjectConfig({ ...projectConfig, context })
+export function setSystemPromptInjection(value: string | null): void {
+  systemPromptInjection = value
+  // Clear context caches immediately when injection changes
+  getUserContext.cache.clear?.()
+  getSystemContext.cache.clear?.()
 }
-
-export function removeContext(key: string): void {
-  const projectConfig = getCurrentProjectConfig()
-  const context = omit(
-    projectConfig.context,
-    key,
-    'codeStyle',
-    'directoryStructure',
-  )
-  saveCurrentProjectConfig({ ...projectConfig, context })
-}
-
-export const getReadme = memoize(async (): Promise<string | null> => {
-  try {
-    const readmePath = join(getCwd(), 'README.md')
-    if (!existsSync(readmePath)) {
-      return null
-    }
-    const content = await readFile(readmePath, 'utf-8')
-    return content
-  } catch (e) {
-    logError(e)
-    return null
-  }
-})
 
 export const getGitStatus = memoize(async (): Promise<string | null> => {
   if (process.env.NODE_ENV === 'test') {
     // Avoid cycles in tests
     return null
   }
-  if (!(await getIsGit())) {
+
+  const startTime = Date.now()
+  logForDiagnosticsNoPII('info', 'git_status_started')
+
+  const isGitStart = Date.now()
+  const isGit = await getIsGit()
+  logForDiagnosticsNoPII('info', 'git_is_git_check_completed', {
+    duration_ms: Date.now() - isGitStart,
+    is_git: isGit,
+  })
+
+  if (!isGit) {
+    logForDiagnosticsNoPII('info', 'git_status_skipped_not_git', {
+      duration_ms: Date.now() - startTime,
+    })
     return null
   }
 
   try {
-    const [branch, mainBranch, status, log, authorLog] = await Promise.all([
+    const gitCmdsStart = Date.now()
+    const [branch, mainBranch, status, log, userName] = await Promise.all([
+      getBranch(),
+      getDefaultBranch(),
+      execFileNoThrow(gitExe(), ['--no-optional-locks', 'status', '--short'], {
+        preserveOutputOnError: false,
+      }).then(({ stdout }) => stdout.trim()),
       execFileNoThrow(
-        'git',
-        ['branch', '--show-current'],
-        undefined,
-        undefined,
-        false,
+        gitExe(),
+        ['--no-optional-locks', 'log', '--oneline', '-n', '5'],
+        {
+          preserveOutputOnError: false,
+        },
       ).then(({ stdout }) => stdout.trim()),
-      execFileNoThrow(
-        'git',
-        ['rev-parse', '--abbrev-ref', 'origin/HEAD'],
-        undefined,
-        undefined,
-        false,
-      ).then(({ stdout }) => stdout.replace('origin/', '').trim()),
-      execFileNoThrow(
-        'git',
-        ['status', '--short'],
-        undefined,
-        undefined,
-        false,
-      ).then(({ stdout }) => stdout.trim()),
-      execFileNoThrow(
-        'git',
-        ['log', '--oneline', '-n', '5'],
-        undefined,
-        undefined,
-        false,
-      ).then(({ stdout }) => stdout.trim()),
-      execFileNoThrow(
-        'git',
-        [
-          'log',
-          '--oneline',
-          '-n',
-          '5',
-          '--author',
-          (await getGitEmail()) || '',
-        ],
-        undefined,
-        undefined,
-        false,
-      ).then(({ stdout }) => stdout.trim()),
+      execFileNoThrow(gitExe(), ['config', 'user.name'], {
+        preserveOutputOnError: false,
+      }).then(({ stdout }) => stdout.trim()),
     ])
-    // Check if status has more than 200 lines
-    const statusLines = status.split('\n').length
+
+    logForDiagnosticsNoPII('info', 'git_commands_completed', {
+      duration_ms: Date.now() - gitCmdsStart,
+      status_length: status.length,
+    })
+
+    // Check if status exceeds character limit
     const truncatedStatus =
-      statusLines > 200
-        ? status.split('\n').slice(0, 200).join('\n') +
-          '\n... (truncated because there are more than 200 lines. If you need more information, run "git status" using BashTool)'
+      status.length > MAX_STATUS_CHARS
+        ? status.substring(0, MAX_STATUS_CHARS) +
+          '\n... (truncated because it exceeds 2k characters. If you need more information, run "git status" using BashTool)'
         : status
 
-    return `This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.\nCurrent branch: ${branch}\n\nMain branch (you will usually use this for PRs): ${mainBranch}\n\nStatus:\n${truncatedStatus || '(clean)'}\n\nRecent commits:\n${log}\n\nYour recent commits:\n${authorLog || '(no recent commits)'}`
+    logForDiagnosticsNoPII('info', 'git_status_completed', {
+      duration_ms: Date.now() - startTime,
+      truncated: status.length > MAX_STATUS_CHARS,
+    })
+
+    return [
+      `This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.`,
+      `Current branch: ${branch}`,
+      `Main branch (you will usually use this for PRs): ${mainBranch}`,
+      ...(userName ? [`Git user: ${userName}`] : []),
+      `Status:\n${truncatedStatus || '(clean)'}`,
+      `Recent commits:\n${log}`,
+    ].join('\n\n')
   } catch (error) {
+    logForDiagnosticsNoPII('error', 'git_status_failed', {
+      duration_ms: Date.now() - startTime,
+    })
     logError(error)
     return null
   }
@@ -154,71 +113,77 @@ export const getGitStatus = memoize(async (): Promise<string | null> => {
 /**
  * This context is prepended to each conversation, and cached for the duration of the conversation.
  */
-export const getContext = memoize(
+export const getSystemContext = memoize(
   async (): Promise<{
     [k: string]: string
   }> => {
-    const codeStyle = getCodeStyle()
-    const projectConfig = getCurrentProjectConfig()
-    const dontCrawl = projectConfig.dontCrawlDirectory
-    const [gitStatus, directoryStructure, claudeFiles, readme] =
-      await Promise.all([
-        getGitStatus(),
-        dontCrawl ? Promise.resolve('') : getDirectoryStructure(),
-        dontCrawl ? Promise.resolve('') : getClaudeFiles(),
-        getReadme(),
-      ])
+    const startTime = Date.now()
+    logForDiagnosticsNoPII('info', 'system_context_started')
+
+    // Skip git status in CCR (unnecessary overhead on resume) or when git instructions are disabled
+    const gitStatus =
+      isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) ||
+      !shouldIncludeGitInstructions()
+        ? null
+        : await getGitStatus()
+
+    // Include system prompt injection if set (for cache breaking, ant-only)
+    const injection = feature('BREAK_CACHE_COMMAND')
+      ? getSystemPromptInjection()
+      : null
+
+    logForDiagnosticsNoPII('info', 'system_context_completed', {
+      duration_ms: Date.now() - startTime,
+      has_git_status: gitStatus !== null,
+      has_injection: injection !== null,
+    })
+
     return {
-      ...projectConfig.context,
-      ...(directoryStructure ? { directoryStructure } : {}),
-      ...(gitStatus ? { gitStatus } : {}),
-      ...(codeStyle ? { codeStyle } : {}),
-      ...(claudeFiles ? { claudeFiles } : {}),
-      ...(readme ? { readme } : {}),
+      ...(gitStatus && { gitStatus }),
+      ...(feature('BREAK_CACHE_COMMAND') && injection
+        ? {
+            cacheBreaker: `[CACHE_BREAKER: ${injection}]`,
+          }
+        : {}),
     }
   },
 )
 
 /**
- * Approximate directory structure, to orient Claude. Claude will start with this, then use
- * tools like LS and View to get more information.
+ * This context is prepended to each conversation, and cached for the duration of the conversation.
  */
-export const getDirectoryStructure = memoize(
-  async function (): Promise<string> {
-    let lines: string
-    try {
-      const abortController = new AbortController()
-      setTimeout(() => {
-        abortController.abort()
-      }, 1_000)
-      const model = await getSlowAndCapableModel()
-      const resultsGen = LSTool.call(
-        {
-          path: '.',
-        },
-        {
-          abortController,
-          options: {
-            commands: [],
-            tools: [],
-            slowAndCapableModel: model,
-            forkNumber: 0,
-            messageLogName: 'unused',
-            maxThinkingTokens: 0,
-          },
-          messageId: undefined,
-          readFileTimestamps: {},
-        },
-      )
-      const result = await lastX(resultsGen)
-      lines = result.data
-    } catch (error) {
-      logError(error)
-      return ''
+export const getUserContext = memoize(
+  async (): Promise<{
+    [k: string]: string
+  }> => {
+    const startTime = Date.now()
+    logForDiagnosticsNoPII('info', 'user_context_started')
+
+    // CLAUDE_CODE_DISABLE_CLAUDE_MDS: hard off, always.
+    // --bare: skip auto-discovery (cwd walk), BUT honor explicit --add-dir.
+    // --bare means "skip what I didn't ask for", not "ignore what I asked for".
+    const shouldDisableClaudeMd =
+      isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS) ||
+      (isBareMode() && getAdditionalDirectoriesForClaudeMd().length === 0)
+    // Await the async I/O (readFile/readdir directory walk) so the event
+    // loop yields naturally at the first fs.readFile.
+    const claudeMd = shouldDisableClaudeMd
+      ? null
+      : getClaudeMds(filterInjectedMemoryFiles(await getMemoryFiles()))
+    // Cache for the auto-mode classifier (yoloClassifier.ts reads this
+    // instead of importing claudemd.ts directly, which would create a
+    // cycle through permissions/filesystem → permissions → yoloClassifier).
+    setCachedClaudeMdContent(claudeMd || null)
+
+    logForDiagnosticsNoPII('info', 'user_context_completed', {
+      duration_ms: Date.now() - startTime,
+      claudemd_length: claudeMd?.length ?? 0,
+      claudemd_disabled: Boolean(shouldDisableClaudeMd),
+    })
+
+    return {
+      ...(claudeMd && { claudeMd }),
+      currentDate: `Today's date is ${getLocalISODate()}.`,
     }
-
-    return `Below is a snapshot of this project's file structure at the start of the conversation. This snapshot will NOT update during the conversation.
-
-${lines}`
   },
 )

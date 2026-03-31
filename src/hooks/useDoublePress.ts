@@ -1,9 +1,9 @@
 // Creates a function that calls one function on the first call and another
 // function on the second call within a certain timeout
 
-import { useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 
-export const DOUBLE_PRESS_TIMEOUT_MS = 2000
+export const DOUBLE_PRESS_TIMEOUT_MS = 800
 
 export function useDoublePress(
   setPending: (pending: boolean) => void,
@@ -11,32 +11,52 @@ export function useDoublePress(
   onFirstPress?: () => void,
 ): () => void {
   const lastPressRef = useRef<number>(0)
-  const timeoutRef = useRef<NodeJS.Timeout>()
+  const timeoutRef = useRef<NodeJS.Timeout | undefined>(undefined)
 
-  return () => {
+  const clearTimeoutSafe = useCallback(() => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current)
+      timeoutRef.current = undefined
+    }
+  }, [])
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      clearTimeoutSafe()
+    }
+  }, [clearTimeoutSafe])
+
+  return useCallback(() => {
     const now = Date.now()
     const timeSinceLastPress = now - lastPressRef.current
+    const isDoublePress =
+      timeSinceLastPress <= DOUBLE_PRESS_TIMEOUT_MS &&
+      timeoutRef.current !== undefined
 
-    // For this to count as a double-call, be sure to check that
-    // timeoutRef.current exists so we don't trigger on triple call
-    // (e.g. of Esc to clear the text input)
-    if (timeSinceLastPress <= DOUBLE_PRESS_TIMEOUT_MS && timeoutRef.current) {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current)
-        timeoutRef.current = undefined
-      }
-      onDoublePress()
+    if (isDoublePress) {
+      // Double press detected
+      clearTimeoutSafe()
       setPending(false)
+      onDoublePress()
     } else {
+      // First press
       onFirstPress?.()
       setPending(true)
-      // @ts-expect-error: Bun is overloading types here, but we're using the NodeJS runtime
+
+      // Clear any existing timeout and set new one
+      clearTimeoutSafe()
       timeoutRef.current = setTimeout(
-        () => setPending(false),
+        (setPending, timeoutRef) => {
+          setPending(false)
+          timeoutRef.current = undefined
+        },
         DOUBLE_PRESS_TIMEOUT_MS,
+        setPending,
+        timeoutRef,
       )
     }
 
     lastPressRef.current = now
-  }
+  }, [setPending, onDoublePress, onFirstPress, clearTimeoutSafe])
 }

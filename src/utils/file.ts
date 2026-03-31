@@ -1,132 +1,84 @@
+import { chmodSync, writeFileSync as fsWriteFileSync } from 'fs'
+import { realpath, stat } from 'fs/promises'
+import { homedir } from 'os'
 import {
-  readFileSync,
-  writeFileSync,
-  openSync,
-  readSync,
-  closeSync,
-  existsSync,
-  readdirSync,
-  opendirSync,
-} from 'fs'
-import { logError } from './log.js'
-import {
-  isAbsolute,
-  normalize,
-  resolve,
-  resolve as resolvePath,
-  relative,
-  sep,
   basename,
   dirname,
   extname,
+  isAbsolute,
   join,
+  normalize,
+  relative,
+  resolve,
+  sep,
 } from 'path'
-import { glob as globLib } from 'glob'
-import { cwd } from 'process'
-import { listAllContentFiles } from './ripgrep.js'
-import { LRUCache } from 'lru-cache'
-import { getCwd } from './state.js'
+import { logEvent } from 'src/services/analytics/index.js'
+import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
+import { getCwd } from '../utils/cwd.js'
+import { logForDebugging } from './debug.js'
+import { isENOENT, isFsInaccessible } from './errors.js'
+import {
+  detectEncodingForResolvedPath,
+  detectLineEndingsForString,
+  type LineEndingType,
+} from './fileRead.js'
+import { fileReadCache } from './fileReadCache.js'
+import { getFsImplementation, safeResolvePath } from './fsOperations.js'
+import { logError } from './log.js'
+import { expandPath } from './path.js'
+import { getPlatform } from './platform.js'
 
 export type File = {
   filename: string
   content: string
 }
 
-export type LineEndingType = 'CRLF' | 'LF'
-
-export async function glob(
-  filePattern: string,
-  cwd: string,
-  { limit, offset }: { limit: number; offset: number },
-  abortSignal: AbortSignal,
-): Promise<{ files: string[]; truncated: boolean }> {
-  // TODO: Use worker threads
-  const paths = await globLib([filePattern], {
-    cwd,
-    nocase: true,
-    nodir: true,
-    signal: abortSignal,
-    stat: true,
-    withFileTypes: true,
-  })
-  const sortedPaths = paths.sort((a, b) => (a.mtimeMs ?? 0) - (b.mtimeMs ?? 0))
-  const truncated = sortedPaths.length > offset + limit
-  return {
-    files: sortedPaths
-      .slice(offset, offset + limit)
-      .map(path => path.fullpath()),
-    truncated,
+/**
+ * Check if a path exists asynchronously.
+ */
+export async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
   }
 }
 
+export const MAX_OUTPUT_SIZE = 0.25 * 1024 * 1024 // 0.25MB in bytes
+
 export function readFileSafe(filepath: string): string | null {
   try {
-    return readFileSync(filepath, 'utf-8')
+    const fs = getFsImplementation()
+    return fs.readFileSync(filepath, { encoding: 'utf8' })
   } catch (error) {
     logError(error)
     return null
   }
 }
 
-export function isInDirectory(
-  relativePath: string,
-  relativeCwd: string,
-): boolean {
-  if (relativePath === '.') {
-    return true
-  }
-
-  // Reject paths starting with ~ (home directory)
-  if (relativePath.startsWith('~')) {
-    return false
-  }
-
-  // Reject paths containing null bytes or other sneaky characters
-  if (relativePath.includes('\0') || relativeCwd.includes('\0')) {
-    return false
-  }
-
-  // Normalize paths to resolve any '..' or '.' segments
-  // and add trailing slashes
-  let normalizedPath = normalize(relativePath)
-  let normalizedCwd = normalize(relativeCwd)
-
-  normalizedPath = normalizedPath.endsWith(sep)
-    ? normalizedPath
-    : normalizedPath + sep
-  normalizedCwd = normalizedCwd.endsWith(sep)
-    ? normalizedCwd
-    : normalizedCwd + sep
-
-  // Join with a base directory to make them absolute-like for comparison
-  // Using 'dummy' as base to avoid any actual file system dependencies
-  const fullPath = resolvePath(cwd(), normalizedCwd, normalizedPath)
-  const fullCwd = resolvePath(cwd(), normalizedCwd)
-
-  // Check if the path starts with the cwd
-  return fullPath.startsWith(fullCwd)
+/**
+ * Get the normalized modification time of a file in milliseconds.
+ * Uses Math.floor to ensure consistent timestamp comparisons across file operations,
+ * reducing false positives from sub-millisecond precision changes (e.g., from IDE
+ * file watchers that touch files without changing content).
+ */
+export function getFileModificationTime(filePath: string): number {
+  const fs = getFsImplementation()
+  return Math.floor(fs.statSync(filePath).mtimeMs)
 }
 
-export function readTextContent(
+/**
+ * Async variant of getFileModificationTime. Same floor semantics.
+ * Use this in async paths (getChangedFiles runs every turn on every readFileState
+ * entry — sync statSync there triggers the slow-operation indicator on network/
+ * slow disks).
+ */
+export async function getFileModificationTimeAsync(
   filePath: string,
-  offset = 0,
-  maxLines?: number,
-): { content: string; lineCount: number; totalLines: number } {
-  const enc = detectFileEncoding(filePath)
-  const content = readFileSync(filePath, enc)
-  const lines = content.split(/\r?\n/)
-
-  // Truncate number of lines if needed
-  const toReturn =
-    maxLines !== undefined && lines.length - offset > maxLines
-      ? lines.slice(offset, offset + maxLines)
-      : lines.slice(offset)
-
-  return {
-    content: toReturn.join('\n'), // TODO: This probably won't work for Windows
-    lineCount: toReturn.length,
-    totalLines: lines.length,
-  }
+): Promise<number> {
+  const s = await getFsImplementation().stat(filePath)
+  return Math.floor(s.mtimeMs)
 }
 
 export function writeTextContent(
@@ -137,184 +89,84 @@ export function writeTextContent(
 ): void {
   let toWrite = content
   if (endings === 'CRLF') {
-    toWrite = content.split('\n').join('\r\n')
+    // Normalize any existing CRLF to LF first so a new_string that already
+    // contains \r\n (raw model output) doesn't become \r\r\n after the join.
+    toWrite = content.replaceAll('\r\n', '\n').split('\n').join('\r\n')
   }
 
-  writeFileSync(filePath, toWrite, { encoding, flush: true })
+  writeFileSyncAndFlush_DEPRECATED(filePath, toWrite, { encoding })
 }
-
-const repoEndingCache = new LRUCache<string, LineEndingType>({
-  fetchMethod: path => detectRepoLineEndingsDirect(path),
-  ttl: 5 * 60 * 1000,
-  ttlAutopurge: false,
-  max: 1000,
-})
-
-export async function detectRepoLineEndings(
-  filePath: string,
-): Promise<LineEndingType | undefined> {
-  return repoEndingCache.fetch(resolve(filePath))
-}
-
-export async function detectRepoLineEndingsDirect(
-  cwd: string,
-): Promise<LineEndingType> {
-  const abortController = new AbortController()
-  setTimeout(() => {
-    abortController.abort()
-  }, 1_000)
-  const allFiles = await listAllContentFiles(cwd, abortController.signal, 15)
-
-  let crlfCount = 0
-  for (const file of allFiles) {
-    const lineEnding = detectLineEndings(file)
-    if (lineEnding === 'CRLF') {
-      crlfCount++
-    }
-  }
-
-  return crlfCount > 3 ? 'CRLF' : 'LF'
-}
-
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-function fetch<K extends {}, V extends {}>(
-  cache: LRUCache<K, V>,
-  key: K,
-  value: () => V,
-): V {
-  if (cache.has(key)) {
-    return cache.get(key)!
-  }
-
-  const v = value()
-  cache.set(key, v)
-  return v
-}
-
-const fileEncodingCache = new LRUCache<string, BufferEncoding>({
-  fetchMethod: path => detectFileEncodingDirect(path),
-  ttl: 5 * 60 * 1000,
-  ttlAutopurge: false,
-  max: 1000,
-})
 
 export function detectFileEncoding(filePath: string): BufferEncoding {
-  const k = resolve(filePath)
-  return fetch(fileEncodingCache, k, () => detectFileEncodingDirect(k))
-}
-
-export function detectFileEncodingDirect(filePath: string): BufferEncoding {
-  const BUFFER_SIZE = 4096
-  const buffer = Buffer.alloc(BUFFER_SIZE)
-
-  let fd: number | undefined = undefined
   try {
-    fd = openSync(filePath, 'r')
-    const bytesRead = readSync(fd, buffer, 0, BUFFER_SIZE, 0)
-
-    if (bytesRead >= 2) {
-      if (buffer[0] === 0xff && buffer[1] === 0xfe) return 'utf16le'
-    }
-
-    if (
-      bytesRead >= 3 &&
-      buffer[0] === 0xef &&
-      buffer[1] === 0xbb &&
-      buffer[2] === 0xbf
-    ) {
-      return 'utf8'
-    }
-
-    const isUtf8 = buffer.slice(0, bytesRead).toString('utf8').length > 0
-    return isUtf8 ? 'utf8' : 'ascii'
+    const fs = getFsImplementation()
+    const { resolvedPath } = safeResolvePath(fs, filePath)
+    return detectEncodingForResolvedPath(resolvedPath)
   } catch (error) {
-    logError(`Error detecting encoding for file ${filePath}: ${error}`)
+    if (isFsInaccessible(error)) {
+      logForDebugging(
+        `detectFileEncoding failed for expected reason: ${error.code}`,
+        {
+          level: 'debug',
+        },
+      )
+    } else {
+      logError(error)
+    }
     return 'utf8'
-  } finally {
-    if (fd) closeSync(fd)
   }
 }
 
-const lineEndingCache = new LRUCache<string, LineEndingType>({
-  fetchMethod: path => detectLineEndingsDirect(path),
-  ttl: 5 * 60 * 1000,
-  ttlAutopurge: false,
-  max: 1000,
-})
-
-export function detectLineEndings(filePath: string): LineEndingType {
-  const k = resolve(filePath)
-  return fetch(lineEndingCache, k, () => detectLineEndingsDirect(k))
-}
-
-export function detectLineEndingsDirect(
+export function detectLineEndings(
   filePath: string,
   encoding: BufferEncoding = 'utf8',
 ): LineEndingType {
   try {
-    const buffer = Buffer.alloc(4096)
-    const fd = openSync(filePath, 'r')
-    const bytesRead = readSync(fd, buffer, 0, 4096, 0)
-    closeSync(fd)
+    const fs = getFsImplementation()
+    const { resolvedPath } = safeResolvePath(fs, filePath)
+    const { buffer, bytesRead } = fs.readSync(resolvedPath, { length: 4096 })
 
     const content = buffer.toString(encoding, 0, bytesRead)
-    let crlfCount = 0
-    let lfCount = 0
-
-    for (let i = 0; i < content.length; i++) {
-      if (content[i] === '\n') {
-        if (i > 0 && content[i - 1] === '\r') {
-          crlfCount++
-        } else {
-          lfCount++
-        }
-      }
-    }
-
-    return crlfCount > lfCount ? 'CRLF' : 'LF'
+    return detectLineEndingsForString(content)
   } catch (error) {
-    logError(`Error detecting line endings for file ${filePath}: ${error}`)
+    logError(error)
     return 'LF'
   }
 }
 
-export function normalizeFilePath(filePath: string): string {
-  const absoluteFilePath = isAbsolute(filePath)
-    ? filePath
-    : resolve(getCwd(), filePath)
-
-  // One weird trick for half-width space characters in MacOS screenshot filenames
-  if (absoluteFilePath.endsWith(' AM.png')) {
-    return absoluteFilePath.replace(
-      ' AM.png',
-      `${String.fromCharCode(8239)}AM.png`,
-    )
-  }
-
-  // One weird trick for half-width space characters in MacOS screenshot filenames
-  if (absoluteFilePath.endsWith(' PM.png')) {
-    return absoluteFilePath.replace(
-      ' PM.png',
-      `${String.fromCharCode(8239)}PM.png`,
-    )
-  }
-
-  return absoluteFilePath
-}
-
-export function getAbsolutePath(path: string | undefined): string | undefined {
-  return path ? (isAbsolute(path) ? path : resolve(getCwd(), path)) : undefined
+export function convertLeadingTabsToSpaces(content: string): string {
+  // The /gm regex scans every line even on no-match; skip it entirely
+  // for the common tab-free case.
+  if (!content.includes('\t')) return content
+  return content.replace(/^\t+/gm, _ => '  '.repeat(_.length))
 }
 
 export function getAbsoluteAndRelativePaths(path: string | undefined): {
   absolutePath: string | undefined
   relativePath: string | undefined
 } {
-  const absolutePath = getAbsolutePath(path)
+  const absolutePath = path ? expandPath(path) : undefined
   const relativePath = absolutePath
     ? relative(getCwd(), absolutePath)
     : undefined
   return { absolutePath, relativePath }
+}
+
+export function getDisplayPath(filePath: string): string {
+  // Use relative path if file is in the current working directory
+  const { relativePath } = getAbsoluteAndRelativePaths(filePath)
+  if (relativePath && !relativePath.startsWith('..')) {
+    return relativePath
+  }
+
+  // Use tilde notation for files in home directory
+  const homeDir = homedir()
+  if (filePath.startsWith(homeDir + sep)) {
+    return '~' + filePath.slice(homeDir.length)
+  }
+
+  // Otherwise return the absolute path
+  return filePath
 }
 
 /**
@@ -324,40 +176,116 @@ export function getAbsoluteAndRelativePaths(path: string | undefined): {
  */
 
 export function findSimilarFile(filePath: string): string | undefined {
+  const fs = getFsImplementation()
   try {
     const dir = dirname(filePath)
     const fileBaseName = basename(filePath, extname(filePath))
 
-    // Check if directory exists
-    if (!existsSync(dir)) {
-      return undefined
-    }
-
     // Get all files in the directory
-    const files = readdirSync(dir)
+    const files = fs.readdirSync(dir)
 
     // Find files with the same base name but different extension
     const similarFiles = files.filter(
       file =>
-        basename(file, extname(file)) === fileBaseName &&
-        join(dir, file) !== filePath,
+        basename(file.name, extname(file.name)) === fileBaseName &&
+        join(dir, file.name) !== filePath,
     )
 
     // Return just the filename of the first match if found
     const firstMatch = similarFiles[0]
     if (firstMatch) {
-      return firstMatch
+      return firstMatch.name
     }
     return undefined
   } catch (error) {
-    // In case of any errors, return undefined
-    logError(`Error finding similar file for ${filePath}: ${error}`)
+    // Missing dir (ENOENT) is expected; for other errors log and return undefined
+    if (!isENOENT(error)) {
+      logError(error)
+    }
     return undefined
   }
 }
 
 /**
- * Adds cat -n style line numbers to the content
+ * Marker included in file-not-found error messages that contain a cwd note.
+ * UI renderers check for this to show a short "File not found" message.
+ */
+export const FILE_NOT_FOUND_CWD_NOTE = 'Note: your current working directory is'
+
+/**
+ * Suggests a corrected path under the current working directory when a file/directory
+ * is not found. Detects the "dropped repo folder" pattern where the model constructs
+ * an absolute path missing the repo directory component.
+ *
+ * Example:
+ *   cwd = /Users/zeeg/src/currentRepo
+ *   requestedPath = /Users/zeeg/src/foobar           (doesn't exist)
+ *   returns        /Users/zeeg/src/currentRepo/foobar (if it exists)
+ *
+ * @param requestedPath - The absolute path that was not found
+ * @returns The corrected path if found under cwd, undefined otherwise
+ */
+export async function suggestPathUnderCwd(
+  requestedPath: string,
+): Promise<string | undefined> {
+  const cwd = getCwd()
+  const cwdParent = dirname(cwd)
+
+  // Resolve symlinks in the requested path's parent directory (e.g., /tmp -> /private/tmp on macOS)
+  // so the prefix comparison works correctly against the cwd (which is already realpath-resolved).
+  let resolvedPath = requestedPath
+  try {
+    const resolvedDir = await realpath(dirname(requestedPath))
+    resolvedPath = join(resolvedDir, basename(requestedPath))
+  } catch {
+    // Parent directory doesn't exist, use the original path
+  }
+
+  // Only check if the requested path is under cwd's parent but not under cwd itself.
+  // When cwdParent is the root directory (e.g., '/'), use it directly as the prefix
+  // to avoid a double-separator '//' that would never match.
+  const cwdParentPrefix = cwdParent === sep ? sep : cwdParent + sep
+  if (
+    !resolvedPath.startsWith(cwdParentPrefix) ||
+    resolvedPath.startsWith(cwd + sep) ||
+    resolvedPath === cwd
+  ) {
+    return undefined
+  }
+
+  // Get the relative path from the parent directory
+  const relFromParent = relative(cwdParent, resolvedPath)
+
+  // Check if the same relative path exists under cwd
+  const correctedPath = join(cwd, relFromParent)
+  try {
+    await stat(correctedPath)
+    return correctedPath
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether to use the compact line-number prefix format (`N\t` instead of
+ * `     N→`). The padded-arrow format costs 9 bytes/line overhead; at
+ * 1.35B Read calls × 132 lines avg this is 2.18% of fleet uncached input
+ * (bq-queries/read_line_prefix_overhead_verify.sql).
+ *
+ * Ant soak validated no Edit error regression (6.29% vs 6.86% baseline).
+ * Killswitch pattern: GB can disable if issues surface externally.
+ */
+export function isCompactLinePrefixEnabled(): boolean {
+  // 3P default: killswitch off = compact format enabled. Client-side only —
+  // no server support needed, safe for Bedrock/Vertex/Foundry.
+  return !getFeatureValue_CACHED_MAY_BE_STALE(
+    'tengu_compact_line_prefix_killswitch',
+    false,
+  )
+}
+
+/**
+ * Adds cat -n style line numbers to the content.
  */
 export function addLineNumbers({
   content,
@@ -371,35 +299,286 @@ export function addLineNumbers({
     return ''
   }
 
-  return content
-    .split(/\r?\n/)
+  const lines = content.split(/\r?\n/)
+
+  if (isCompactLinePrefixEnabled()) {
+    return lines
+      .map((line, index) => `${index + startLine}\t${line}`)
+      .join('\n')
+  }
+
+  return lines
     .map((line, index) => {
-      const lineNum = index + startLine
-      const numStr = String(lineNum)
-      // Handle large numbers differently
+      const numStr = String(index + startLine)
       if (numStr.length >= 6) {
-        return `${numStr}\t${line}`
+        return `${numStr}→${line}`
       }
-      // Regular numbers get padding to 6 characters
-      const n = numStr.padStart(6, ' ')
-      return `${n}\t${line}`
+      return `${numStr.padStart(6, ' ')}→${line}`
     })
-    .join('\n') // TODO: This probably won't work for Windows
+    .join('\n')
 }
 
 /**
- * Checks if a directory is empty by efficiently reading just the first entry
+ * Inverse of addLineNumbers — strips the `N→` or `N\t` prefix from a single
+ * line. Co-located so format changes here and in addLineNumbers stay in sync.
+ */
+export function stripLineNumberPrefix(line: string): string {
+  const match = line.match(/^\s*\d+[\u2192\t](.*)$/)
+  return match?.[1] ?? line
+}
+
+/**
+ * Checks if a directory is empty.
  * @param dirPath The path to the directory to check
- * @returns true if the directory is empty, false otherwise
+ * @returns true if the directory is empty or does not exist, false otherwise
  */
 export function isDirEmpty(dirPath: string): boolean {
   try {
-    const dir = opendirSync(dirPath)
-    const firstEntry = dir.readSync()
-    dir.closeSync()
-    return firstEntry === null
-  } catch (error) {
-    logError(`Error checking directory: ${error}`)
+    return getFsImplementation().isDirEmptySync(dirPath)
+  } catch (e) {
+    // ENOENT: directory doesn't exist, consider it empty
+    // Other errors (EPERM on macOS protected folders, etc.): assume not empty
+    return isENOENT(e)
+  }
+}
+
+/**
+ * Reads a file with caching to avoid redundant I/O operations.
+ * This is the preferred method for FileEditTool operations.
+ */
+export function readFileSyncCached(filePath: string): string {
+  const { content } = fileReadCache.readFile(filePath)
+  return content
+}
+
+/**
+ * Writes to a file and flushes the file to disk
+ * @param filePath The path to the file to write to
+ * @param content The content to write to the file
+ * @param options Options for writing the file, including encoding and mode
+ * @deprecated Use `fs.promises.writeFile` with flush option instead for non-blocking writes.
+ * Sync file writes block the event loop and cause performance issues.
+ */
+export function writeFileSyncAndFlush_DEPRECATED(
+  filePath: string,
+  content: string,
+  options: { encoding: BufferEncoding; mode?: number } = { encoding: 'utf-8' },
+): void {
+  const fs = getFsImplementation()
+
+  // Check if the target file is a symlink to preserve it for all users
+  // Note: We don't use safeResolvePath here because we need to manually handle
+  // symlinks to ensure we write to the target while preserving the symlink itself
+  let targetPath = filePath
+  try {
+    // Try to read the symlink - if successful, it's a symlink
+    const linkTarget = fs.readlinkSync(filePath)
+    // Resolve to absolute path
+    targetPath = isAbsolute(linkTarget)
+      ? linkTarget
+      : resolve(dirname(filePath), linkTarget)
+    logForDebugging(`Writing through symlink: ${filePath} -> ${targetPath}`)
+  } catch {
+    // ENOENT (doesn't exist) or EINVAL (not a symlink) — keep targetPath = filePath
+  }
+
+  // Try atomic write first
+  const tempPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`
+
+  // Check if target file exists and get its permissions (single stat, reused in both atomic and fallback paths)
+  let targetMode: number | undefined
+  let targetExists = false
+  try {
+    targetMode = fs.statSync(targetPath).mode
+    targetExists = true
+    logForDebugging(`Preserving file permissions: ${targetMode.toString(8)}`)
+  } catch (e) {
+    if (!isENOENT(e)) throw e
+    if (options.mode !== undefined) {
+      // Use provided mode for new files
+      targetMode = options.mode
+      logForDebugging(
+        `Setting permissions for new file: ${targetMode.toString(8)}`,
+      )
+    }
+  }
+
+  try {
+    logForDebugging(`Writing to temp file: ${tempPath}`)
+
+    // Write to temp file with flush and mode (if specified for new file)
+    const writeOptions: {
+      encoding: BufferEncoding
+      flush: boolean
+      mode?: number
+    } = {
+      encoding: options.encoding,
+      flush: true,
+    }
+    // Only set mode in writeFileSync for new files to ensure atomic permission setting
+    if (!targetExists && options.mode !== undefined) {
+      writeOptions.mode = options.mode
+    }
+
+    fsWriteFileSync(tempPath, content, writeOptions)
+    logForDebugging(
+      `Temp file written successfully, size: ${content.length} bytes`,
+    )
+
+    // For existing files or if mode was not set atomically, apply permissions
+    if (targetExists && targetMode !== undefined) {
+      chmodSync(tempPath, targetMode)
+      logForDebugging(`Applied original permissions to temp file`)
+    }
+
+    // Atomic rename (on POSIX systems, this is atomic)
+    // On Windows, this will overwrite the destination if it exists
+    logForDebugging(`Renaming ${tempPath} to ${targetPath}`)
+    fs.renameSync(tempPath, targetPath)
+    logForDebugging(`File ${targetPath} written atomically`)
+  } catch (atomicError) {
+    logForDebugging(`Failed to write file atomically: ${atomicError}`, {
+      level: 'error',
+    })
+    logEvent('tengu_atomic_write_error', {})
+
+    // Clean up temp file on error
+    try {
+      logForDebugging(`Cleaning up temp file: ${tempPath}`)
+      fs.unlinkSync(tempPath)
+    } catch (cleanupError) {
+      logForDebugging(`Failed to clean up temp file: ${cleanupError}`)
+    }
+
+    // Fallback to non-atomic write
+    logForDebugging(`Falling back to non-atomic write for ${targetPath}`)
+    try {
+      const fallbackOptions: {
+        encoding: BufferEncoding
+        flush: boolean
+        mode?: number
+      } = {
+        encoding: options.encoding,
+        flush: true,
+      }
+      // Only set mode for new files
+      if (!targetExists && options.mode !== undefined) {
+        fallbackOptions.mode = options.mode
+      }
+
+      fsWriteFileSync(targetPath, content, fallbackOptions)
+      logForDebugging(
+        `File ${targetPath} written successfully with non-atomic fallback`,
+      )
+    } catch (fallbackError) {
+      logForDebugging(`Non-atomic write also failed: ${fallbackError}`)
+      throw fallbackError
+    }
+  }
+}
+
+export function getDesktopPath(): string {
+  const platform = getPlatform()
+  const homeDir = homedir()
+
+  if (platform === 'macos') {
+    return join(homeDir, 'Desktop')
+  }
+
+  if (platform === 'windows') {
+    // For WSL, try to access Windows desktop
+    const windowsHome = process.env.USERPROFILE
+      ? process.env.USERPROFILE.replace(/\\/g, '/')
+      : null
+
+    if (windowsHome) {
+      const wslPath = windowsHome.replace(/^[A-Z]:/, '')
+      const desktopPath = `/mnt/c${wslPath}/Desktop`
+
+      if (getFsImplementation().existsSync(desktopPath)) {
+        return desktopPath
+      }
+    }
+
+    // Fallback: try to find desktop in typical Windows user location
+    try {
+      const usersDir = '/mnt/c/Users'
+      const userDirs = getFsImplementation().readdirSync(usersDir)
+
+      for (const user of userDirs) {
+        if (
+          user.name === 'Public' ||
+          user.name === 'Default' ||
+          user.name === 'Default User' ||
+          user.name === 'All Users'
+        ) {
+          continue
+        }
+
+        const potentialDesktopPath = join(usersDir, user.name, 'Desktop')
+
+        if (getFsImplementation().existsSync(potentialDesktopPath)) {
+          return potentialDesktopPath
+        }
+      }
+    } catch (error) {
+      logError(error)
+    }
+  }
+
+  // Linux/unknown platform fallback
+  const desktopPath = join(homeDir, 'Desktop')
+  if (getFsImplementation().existsSync(desktopPath)) {
+    return desktopPath
+  }
+
+  // If Desktop folder doesn't exist, fallback to home directory
+  return homeDir
+}
+
+/**
+ * Validates that a file size is within the specified limit.
+ * Returns true if the file is within the limit, false otherwise.
+ *
+ * @param filePath The path to the file to validate
+ * @param maxSizeBytes The maximum allowed file size in bytes
+ * @returns true if file size is within limit, false otherwise
+ */
+export function isFileWithinReadSizeLimit(
+  filePath: string,
+  maxSizeBytes: number = MAX_OUTPUT_SIZE,
+): boolean {
+  try {
+    const stats = getFsImplementation().statSync(filePath)
+    return stats.size <= maxSizeBytes
+  } catch {
+    // If we can't stat the file, return false to indicate validation failure
     return false
   }
+}
+
+/**
+ * Normalize a file path for comparison, handling platform differences.
+ * On Windows, normalizes path separators and converts to lowercase for
+ * case-insensitive comparison.
+ */
+export function normalizePathForComparison(filePath: string): string {
+  // Use path.normalize() to clean up redundant separators and resolve . and ..
+  let normalized = normalize(filePath)
+
+  // On Windows, normalize for case-insensitive comparison:
+  // - Convert forward slashes to backslashes (path.normalize only does this on actual Windows)
+  // - Convert to lowercase (Windows paths are case-insensitive)
+  if (getPlatform() === 'windows') {
+    normalized = normalized.replace(/\//g, '\\').toLowerCase()
+  }
+
+  return normalized
+}
+
+/**
+ * Compare two file paths for equality, handling Windows case-insensitivity.
+ */
+export function pathsEqual(path1: string, path2: string): boolean {
+  return normalizePathForComparison(path1) === normalizePathForComparison(path2)
 }

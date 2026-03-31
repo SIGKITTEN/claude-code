@@ -1,24 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useContext } from 'react'
+import {
+  type TerminalSize,
+  TerminalSizeContext,
+} from 'src/ink/components/TerminalSizeContext.js'
 
-export function useTerminalSize() {
-  const [size, setSize] = useState({
-    columns: process.stdout.columns || 80,
-    rows: process.stdout.rows || 24,
-  })
+export function useTerminalSize(): TerminalSize {
+  const size = useContext(TerminalSizeContext)
 
-  useEffect(() => {
-    function updateSize() {
-      setSize({
-        columns: process.stdout.columns || 80,
-        rows: process.stdout.rows || 24,
-      })
-    }
-
-    process.stdout.on('resize', updateSize)
-    return () => {
-      process.stdout.off('resize', updateSize)
-    }
-  }, [])
+  if (!size) {
+    throw new Error('useTerminalSize must be used within an Ink App component')
+  }
 
   return size
 }

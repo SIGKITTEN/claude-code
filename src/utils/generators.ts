@@ -11,6 +11,16 @@ export async function lastX<A>(as: AsyncGenerator<A>): Promise<A> {
   return lastValue
 }
 
+export async function returnValue<A>(
+  as: AsyncGenerator<unknown, A>,
+): Promise<A> {
+  let e
+  do {
+    e = await as.next()
+  } while (!e.done)
+  return e.value
+}
+
 type QueuedGenerator<A> = {
   done: boolean | void
   value: A | void
@@ -58,5 +68,21 @@ export async function* all<A>(
       const nextGen = waiting.shift()!
       promises.add(next(nextGen))
     }
+  }
+}
+
+export async function toArray<A>(
+  generator: AsyncGenerator<A, void>,
+): Promise<A[]> {
+  const result: A[] = []
+  for await (const a of generator) {
+    result.push(a)
+  }
+  return result
+}
+
+export async function* fromArray<T>(values: T[]): AsyncGenerator<T, void> {
+  for (const value of values) {
+    yield value
   }
 }
