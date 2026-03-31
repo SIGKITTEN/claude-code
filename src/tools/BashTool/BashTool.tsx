@@ -251,7 +251,7 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 // Exposing it in the schema would let the model bypass permission checks and the
 // sandbox by pairing an innocuous command with an arbitrary file write.
 // Also conditionally remove run_in_background when background tasks are disabled.
-const inputSchema = lazySchema(() => isBackgroundTasksDisabled ? fullInputSchema().omit({
+export const inputSchema = lazySchema(() => isBackgroundTasksDisabled ? fullInputSchema().omit({
   run_in_background: true,
   _simulatedSedEdit: true
 }) : fullInputSchema().omit({

@@ -275,6 +275,9 @@ function addToTotalModelUsage(
   return modelUsage
 }
 
+// Legacy alias
+export const addToTotalCost = addToTotalSessionCost
+
 export function addToTotalSessionCost(
   cost: number,
   usage: Usage,

@@ -134,6 +134,9 @@ export function getUserForGrowthBook(): CoreUserData {
   return getCoreUserData(true)
 }
 
+// Legacy alias (referenced by statsig.ts)
+export const getUser = getCoreUserData
+
 function getEmail(): string | undefined {
   // Return cached email if available (from async initialization)
   if (cachedEmail !== null) {

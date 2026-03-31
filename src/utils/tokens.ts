@@ -4,6 +4,9 @@ import type { AssistantMessage, Message } from '../types/message.js'
 import { SYNTHETIC_MESSAGES, SYNTHETIC_MODEL } from './messages.js'
 import { jsonStringify } from './slowOperations.js'
 
+// Legacy stub
+export async function countTokens(_text: string): Promise<number> { return 0 }
+
 export function getTokenUsage(message: Message): Usage | undefined {
   if (
     message?.type === 'assistant' &&

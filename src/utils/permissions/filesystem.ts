@@ -1,3 +1,6 @@
+// Legacy stub
+export function grantWritePermissionForOriginalDir(): void {}
+
 import { feature } from 'bun:bundle'
 import { randomBytes } from 'crypto'
 import ignore from 'ignore'

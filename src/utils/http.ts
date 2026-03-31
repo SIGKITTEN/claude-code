@@ -3,6 +3,9 @@
  */
 
 import axios from 'axios'
+
+// Legacy alias
+export const USER_AGENT = 'claude-code/2.1.88'
 import { OAUTH_BETA_HEADER } from '../constants/oauth.js'
 import {
   getAnthropicApiKey,

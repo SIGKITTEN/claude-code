@@ -1754,6 +1754,11 @@ export function getAutoUpdaterDisabledReason(): AutoUpdaterDisabledReason | null
   return null
 }
 
+// Legacy stub (referenced by services/claude.ts)
+export function getAnthropicApiKey(): string | undefined {
+  return process.env.ANTHROPIC_API_KEY
+}
+
 export function getOrCreateUserID(): string {
   const config = getGlobalConfig()
   if (config.userID) {

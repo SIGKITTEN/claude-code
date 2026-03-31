@@ -1,5 +1,8 @@
 import { feature } from 'bun:bundle'
 import memoize from 'lodash-es/memoize.js'
+
+// Legacy alias (referenced by statsig.ts)
+export const getBetas = (): string[] => []
 import {
   checkStatsigFeatureGate_CACHED_MAY_BE_STALE,
   getFeatureValue_CACHED_MAY_BE_STALE,

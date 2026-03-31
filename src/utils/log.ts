@@ -1,5 +1,9 @@
 import { feature } from 'bun:bundle'
+import { getSessionId } from '../bootstrap/state.js'
 import type { BetaMessageStreamParams } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+
+// Legacy export (referenced by statsig.ts / claude.ts)
+export const SESSION_ID = getSessionId()
 import { readdir, readFile, stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
 import { join } from 'path'
